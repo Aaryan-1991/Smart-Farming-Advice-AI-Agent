@@ -1,0 +1,20 @@
+/* ============================================================
+   KrishiMitra — Additional Animations & Effects
+   static/css/style.css  — extra helper rules
+   (These are additional rules appended to the main stylesheet
+    via the same file path; imported in a separate call)
+   ============================================================ */
+
+/* Notification badge pulse */
+.notification-pulse {
+  position: relative;
+}
+.notification-pulse::after {
+  content: '';
+  position: absolute;
+  top: -3px; right: -3px;
+  width: 10px; height: 10px;
+  background: var(--danger);
+  border-radius: 50%;
+  animation: pulse 1.5s ease-in-out infinite;
+}
