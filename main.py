@@ -1,7 +1,7 @@
 """
 ============================================================
   Smart Farming Advice AI Agent
-  Backend  —  app.py
+  Backend  —  main.py
   Framework : Flask 3.x
   AI Engine : IBM Watsonx.ai  (Granite)
   Author    : IBM Watsonx Smart Farming Team
