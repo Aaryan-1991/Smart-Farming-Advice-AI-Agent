@@ -241,7 +241,10 @@ async function sendMessage() {
   // Clear input
   input.value = "";
   input.style.height = "auto";
-  document.getElementById("charCount").textContent = "0/1000";
+
+  // FIX #12: Guard charCount reference — it may not exist on every page variant.
+  const charCountEl = document.getElementById("charCount");
+  if (charCountEl) charCountEl.textContent = "0/1000";
 
   // Hide suggestions after first message
   const suggestions = document.getElementById("chatSuggestions");
@@ -262,25 +265,57 @@ async function sendMessage() {
       }),
     });
 
+    // FIX #11: Check HTTP status BEFORE attempting res.json().
+    // A 500, 502, 503, or 504 may return HTML (nginx/gunicorn error page)
+    // instead of JSON, causing res.json() to throw and falling into the
+    // generic "Connection error" catch block — masking the real error.
+    if (!res.ok) {
+      // Try to parse JSON error body; fall back to status text.
+      let errMsg = `Server error (HTTP ${res.status})`;
+      try {
+        const errData = await res.json();
+        if (errData && errData.error) errMsg = errData.error;
+      } catch (_) { /* body was not JSON — use the status text */ }
+
+      showTypingIndicator(false);
+      setState(false);
+      addMessageToChat("bot", `⚠️ ${errMsg}`);
+      console.error("Chat HTTP error:", res.status, errMsg);
+      return;
+    }
+
     const data = await res.json();
     showTypingIndicator(false);
     setState(false);
 
-    if (data.error) {
-      addMessageToChat("bot", `⚠️ Error: ${data.error}`);
+    // FIX #1 / #10:
+    //   OLD: data.response || "I couldn't generate..."
+    //   PROBLEM: the || operator treats any falsy value (empty string,
+    //   null, undefined, 0) as a failure — so a legitimate short reply
+    //   of "0" or "" would silently show the fallback message.
+    //   NEW: Check data.success explicitly.  If the backend set
+    //   success=false we show data.error.  Otherwise we use data.response
+    //   and only fall back if it is genuinely absent/null.
+    if (data.success === false) {
+      addMessageToChat("bot", `⚠️ ${data.error || "An unknown error occurred."}`);
     } else {
-      const reply = data.response || "I couldn't generate a response. Please try again.";
+      // data.response is a non-empty string guaranteed by the backend
+      // (it falls back to the demo response before returning success=true).
+      const reply = data.response != null
+        ? String(data.response)
+        : "I couldn't generate a response. Please try again.";
       addMessageToChat("bot", reply);
       STATE.conversationHistory.push({ role: "assistant", content: reply });
     }
   } catch (err) {
+    // Network-level failure (DNS, CORS, fetch abort, JSON parse error)
     showTypingIndicator(false);
     setState(false);
     addMessageToChat(
       "bot",
       "⚠️ Connection error. Please check your internet connection and try again."
     );
-    console.error("Chat error:", err);
+    console.error("Chat fetch error:", err);
   }
 }
 
@@ -382,36 +417,62 @@ function copyLastResponse() {
 //  MARKDOWN RENDERER (simple, no external lib)
 // ═══════════════════════════════════════════════════════════
 function renderMarkdown(text) {
+  // FIX #13: Escape HTML first, then apply markdown transforms.
+  // The previous nested-list regex /(<li>.*<\/li>)/gs wrapped ALL
+  // contiguous <li> elements in a *single* <ul> but the `s` (dotAll)
+  // flag made it greedily span across unrelated list blocks, producing
+  // doubled or un-closed <ul> tags.
+  // Fixed approach: collect runs of <li> lines and wrap them once.
   let html = escapeHtml(text);
 
-  // Tables
-  html = html.replace(/\|(.+)\|\n\|[-| ]+\|\n((?:\|.+\|\n?)+)/g, (match, header, rows) => {
-    const ths = header.split("|").filter(Boolean).map((h) => `<th>${h.trim()}</th>`).join("");
-    const trs = rows.trim().split("\n").map((row) => {
-      const tds = row.split("|").filter(Boolean).map((d) => `<td>${d.trim()}</td>`).join("");
-      return `<tr>${tds}</tr>`;
-    }).join("");
-    return `<table><thead><tr>${ths}</tr></thead><tbody>${trs}</tbody></table>`;
-  });
+  // Tables (must come before bold/italic to avoid corrupting pipes)
+  html = html.replace(
+    /\|(.+)\|\n\|[-| ]+\|\n((?:\|.+\|\n?)+)/g,
+    (match, header, rows) => {
+      const ths = header
+        .split("|")
+        .filter(Boolean)
+        .map((h) => `<th>${h.trim()}</th>`)
+        .join("");
+      const trs = rows
+        .trim()
+        .split("\n")
+        .map((row) => {
+          const tds = row
+            .split("|")
+            .filter(Boolean)
+            .map((d) => `<td>${d.trim()}</td>`)
+            .join("");
+          return `<tr>${tds}</tr>`;
+        })
+        .join("");
+      return `<table><thead><tr>${ths}</tr></thead><tbody>${trs}</tbody></table>`;
+    }
+  );
 
-  // Bold
-  html = html.replace(/\*\*(.+?)\*\*/g, "<strong>$1</strong>");
-  // Italic
-  html = html.replace(/\*(.+?)\*/g, "<em>$1</em>");
   // Headings
   html = html.replace(/^### (.+)$/gm, "<h3>$1</h3>");
   html = html.replace(/^## (.+)$/gm, "<h2>$1</h2>");
   html = html.replace(/^# (.+)$/gm, "<h2>$1</h2>");
-  // Unordered lists
+
+  // Bold and italic
+  html = html.replace(/\*\*(.+?)\*\*/g, "<strong>$1</strong>");
+  html = html.replace(/\*(.+?)\*/g, "<em>$1</em>");
+
+  // FIX #13: Convert list lines to <li> then wrap consecutive runs
+  // in a single <ul> — avoids the dotAll-greedy double-wrap bug.
   html = html.replace(/^[\*\-] (.+)$/gm, "<li>$1</li>");
-  html = html.replace(/(<li>.*<\/li>)/gs, "<ul>$1</ul>");
-  // Ordered lists
   html = html.replace(/^\d+\. (.+)$/gm, "<li>$1</li>");
-  // Paragraph breaks
+  // Wrap runs of <li> elements (separated by nothing or just \n) in <ul>.
+  html = html.replace(/(<li>[\s\S]*?<\/li>)(\n<li>[\s\S]*?<\/li>)*/g, (block) => {
+    // block is already a run of <li>…</li>; wrap it once.
+    return `<ul>${block}</ul>`;
+  });
+
+  // Paragraph breaks and line breaks
   html = html.replace(/\n{2,}/g, "</p><p>");
   html = html.replace(/\n/g, "<br />");
-  // Clean up nested
-  html = html.replace(/<\/ul><ul>/g, "");
+
   return `<p>${html}</p>`;
 }
 
@@ -445,6 +506,7 @@ async function getCropRecommendations() {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(payload),
     });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
     const data = await res.json();
     renderCropResults(data);
   } catch (err) {
@@ -459,16 +521,16 @@ function renderCropResults(data) {
 
   const cards = recs.map((r) => `
     <div class="col-sm-6">
-      <div class="rec-card" onclick="askAbout('${r.crop} cultivation guide')">
+      <div class="rec-card" onclick="askAbout('${escapeHtml(r.crop)} cultivation guide')">
         <div class="d-flex justify-content-between align-items-start">
-          <div class="rec-crop-name">🌾 ${r.crop}</div>
+          <div class="rec-crop-name">🌾 ${escapeHtml(r.crop)}</div>
           <span class="badge ${r.soil_match ? "bg-success" : "bg-secondary"}" style="font-size:10px">
             ${r.soil_match ? "✓ Soil Match" : "Check Soil"}
           </span>
         </div>
-        <div class="rec-detail mt-1">Season: <strong>${r.season}</strong></div>
-        <div class="rec-detail">Water: ${r.water_need} &bull; pH: ${r.recommended_pH}</div>
-        <div class="rec-detail">Nutrients: ${r.nutrients}</div>
+        <div class="rec-detail mt-1">Season: <strong>${escapeHtml(r.season)}</strong></div>
+        <div class="rec-detail">Water: ${escapeHtml(r.water_need)} &bull; pH: ${escapeHtml(r.recommended_pH)}</div>
+        <div class="rec-detail">Nutrients: ${escapeHtml(r.nutrients)}</div>
       </div>
     </div>`).join("");
 
@@ -516,6 +578,7 @@ async function analyseSoil() {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(payload),
     });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
     const data = await res.json();
     renderSoilResults(data);
   } catch (err) {
@@ -533,11 +596,11 @@ function renderSoilResults(data) {
     score >= 50 ? "score-fair" : "score-poor";
 
   const issues = (data.issues || []).map((i) =>
-    `<li class="text-danger"><i class="bi bi-exclamation-triangle-fill me-2"></i>${i}</li>`
+    `<li class="text-danger"><i class="bi bi-exclamation-triangle-fill me-2"></i>${escapeHtml(i)}</li>`
   ).join("") || "<li class='text-success'>No critical issues found!</li>";
 
   const actions = (data.recommended_actions || []).map((a) =>
-    `<li><i class="bi bi-check2-circle text-success me-2"></i>${a}</li>`
+    `<li><i class="bi bi-check2-circle text-success me-2"></i>${escapeHtml(a)}</li>`
   ).join("") || "<li>Maintain current practices.</li>";
 
   el.innerHTML = `
@@ -547,7 +610,7 @@ function renderSoilResults(data) {
       </div>
       <div class="result-card-body text-center">
         <div class="health-score-ring ${ringClass}">${score}</div>
-        <h5 class="mb-0">${data.health_rating}</h5>
+        <h5 class="mb-0">${escapeHtml(data.health_rating || "")}</h5>
         <p class="text-muted small mt-1">Out of 100 — ${data.parameters ? `pH ${data.parameters.pH} &bull; N:${data.parameters.Nitrogen} &bull; P:${data.parameters.Phosphorus} &bull; K:${data.parameters.Potassium}` : ""}</p>
       </div>
     </div>
@@ -596,6 +659,7 @@ async function getWeatherAdvice() {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(payload),
     });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
     const data = await res.json();
     renderWeatherResults(data, payload);
   } catch (err) {
@@ -632,15 +696,15 @@ function renderWeatherResults(data, payload) {
         <div class="d-flex justify-content-between align-items-center flex-wrap gap-2">
           <div>
             <span style="font-size:2rem">${weatherEmoji}</span>
-            <span class="fw-bold ms-2 text-capitalize">${payload.condition}</span>
+            <span class="fw-bold ms-2 text-capitalize">${escapeHtml(payload.condition)}</span>
           </div>
           <span class="alert-badge ${alertClass}">${alertLabel}</span>
         </div>
         <div class="d-flex gap-3 mt-2 flex-wrap">
           <span class="badge bg-secondary">🌡️ ${payload.temperature}°C</span>
           <span class="badge bg-secondary">🌧️ ${payload.rainfall_mm}mm/week</span>
-          <span class="badge bg-secondary">🌱 ${payload.crop}</span>
-          <span class="badge bg-secondary">📅 ${payload.season}</span>
+          <span class="badge bg-secondary">🌱 ${escapeHtml(payload.crop)}</span>
+          <span class="badge bg-secondary">📅 ${escapeHtml(payload.season)}</span>
         </div>
       </div>
     </div>
@@ -648,7 +712,7 @@ function renderWeatherResults(data, payload) {
       <div class="result-card-header"><i class="bi bi-robot text-primary me-2"></i>AI Weather-Smart Advice</div>
       <div class="result-card-body">
         <div class="ai-narrative">${renderMarkdown(data.advice || "")}</div>
-        <button class="btn btn-outline-info btn-sm mt-3" onclick="askAbout('weather resistant farming practices for ${payload.crop}')">
+        <button class="btn btn-outline-info btn-sm mt-3" onclick="askAbout('weather resistant farming practices for ${escapeHtml(payload.crop)}')">
           <i class="bi bi-chat-dots me-1"></i>Get More Weather Tips
         </button>
       </div>
@@ -706,7 +770,7 @@ function buildLoadingHTML(msg) {
     <div class="result-card animate-fadeInUp">
       <div class="result-card-body text-center py-4">
         <div class="ai-spinner mb-3" style="width:36px;height:36px;border-width:3px;margin:0 auto"></div>
-        <p class="text-muted mb-0">${msg}</p>
+        <p class="text-muted mb-0">${escapeHtml(msg)}</p>
         <div class="mt-3">
           <div class="skeleton" style="width:80%;margin:0 auto"></div>
           <div class="skeleton" style="width:65%;margin:8px auto"></div>
@@ -721,7 +785,7 @@ function errorHTML(msg) {
     <div class="result-card">
       <div class="result-card-body text-center py-4 text-danger">
         <i class="bi bi-exclamation-circle fs-2 mb-2"></i>
-        <p class="mb-0">${msg}</p>
+        <p class="mb-0">${escapeHtml(msg)}</p>
       </div>
     </div>`;
 }
